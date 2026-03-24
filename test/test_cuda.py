@@ -4774,6 +4774,7 @@ class TestResizeStorageHint(TestCase):
         TEST_CUDAMALLOCASYNC,
         "CUDAMallocAsync does not use the caching allocator hint path",
     )
+    @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
     def test_resize_split_block(self):
         pool = torch.cuda.MemPool()
 
@@ -4805,6 +4806,7 @@ class TestResizeStorageHint(TestCase):
         TEST_CUDAMALLOCASYNC,
         "CUDAMallocAsync does not use the caching allocator hint path",
     )
+    @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
     @skipIfRocm(msg="expandable_segments mode is not supported on ROCm")
     def test_resize_storage_hint_expandable_segments_with_split_block(self):
         torch.cuda.empty_cache()
