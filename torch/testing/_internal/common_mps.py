@@ -749,11 +749,7 @@ if torch.backends.mps.is_available():
             "nn.functional.conv3d": [torch.int64],
             "nn.functional.conv_transpose1d": [torch.int64],
             "nn.functional.conv_transpose2d": [torch.int64],
-            "nn.functional.conv_transpose3d": [
-                torch.int64,
-                torch.bfloat16,
-                torch.float16,
-            ],
+            "nn.functional.conv_transpose3d": [torch.int64],
             # Unsupported dtypes
             # GEMM on MPS is not supported for integral types
             "nn.functional.linear": [
@@ -1075,7 +1071,6 @@ if torch.backends.mps.is_available():
             "topk": [torch.float16],
             "nn.functional.pairwise_distance": [torch.float16],
             "nn.functional.conv3d": [torch.float16],
-            "nn.functional.conv_transpose3d": [torch.float16],
         }
 
         ON_MPS_XFAILLIST = {
