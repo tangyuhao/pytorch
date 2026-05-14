@@ -420,6 +420,154 @@ class TestCachingAutotunerPlugin(TestCase):
         self.assertIs(result, sentinel)
         mock_autotune.assert_not_called()
 
+    def test_no_launch_autotune_uses_default_autotune_path(self):
+        seen = []
+
+        class _Plugin(CachingAutotunerPlugin):
+            def pre_autotune(self, autotuner, *args, stream, **kwargs):
+                seen.append("pre_autotune")
+                return object()
+
+        autotuner = self._make_autotuner([_Plugin()])
+        launcher_a = MagicMock()
+        launcher_a.config = triton_config({"x": 16}, 64)
+        launcher_b = MagicMock()
+        launcher_b.config = triton_config({"x": 256}, 64)
+        autotuner.launchers = [launcher_a, launcher_b]
+
+        def autotune_to_launcher_a(*args, **kwargs):
+            autotuner.launchers = [launcher_a]
+
+        with patch.object(
+            autotuner,
+            "autotune_to_one_config",
+            side_effect=autotune_to_launcher_a,
+        ) as mock_autotune:
+            result = autotuner.autotune_to_one_config_no_launch(
+                *self._make_kernel_inputs(), stream=self._get_stream()
+            )
+
+        self.assertIs(result, launcher_a.config)
+        self.assertEqual(seen, [])
+        mock_autotune.assert_called_once()
+
+    def test_combo_seed_start_skips_cached_combo_autotune_config(self):
+        from torch._inductor.runtime.triton_heuristics import (
+            start_combo_kernel_standalone_autotune,
+        )
+
+        autotuner = self._make_autotuner([])
+        autotuner.inductor_meta["combo_tuning_groups"] = [
+            {"member_indices": [0], "skip_rblock": False}
+        ]
+        autotuner.configs = [triton_config({"x": 16}, 64)]
+        autotuner.configs[0].found_by_combo_autotune = True
+
+        with patch(
+            "torch._inductor.autotune_process.PrecompileThreadPool.get_instance"
+        ) as mock_get_pool:
+            start_combo_kernel_standalone_autotune(
+                autotuner, ((MagicMock(), ()),)
+            )
+
+        mock_get_pool.assert_not_called()
+        self.assertIsNone(autotuner.combo_standalone_autotune_seed_future)
+
+    def test_combo_seed_start_submits_one_future_per_seed(self):
+        from torch._inductor.runtime.triton_heuristics import (
+            start_combo_kernel_standalone_autotune,
+        )
+
+        autotuner = self._make_autotuner([])
+        autotuner.inductor_meta["combo_tuning_groups"] = [
+            {"member_indices": [0, 1], "skip_rblock": False}
+        ]
+        future_a = MagicMock()
+        future_b = MagicMock()
+        pool = MagicMock()
+        pool.submit.side_effect = [future_a, future_b]
+
+        with patch(
+            "torch._inductor.autotune_process.PrecompileThreadPool.get_instance",
+            return_value=pool,
+        ):
+            start_combo_kernel_standalone_autotune(
+                autotuner,
+                ((MagicMock(), ("a",)), (MagicMock(), ("b",))),
+            )
+
+        self.assertEqual(pool.submit.call_count, 2)
+        self.assertEqual(
+            autotuner.combo_standalone_autotune_seed_future,
+            [future_a, future_b],
+        )
+
+    def test_coordinate_descent_save_preserves_combo_autotune_marker(self):
+        autotuner = self._make_autotuner([])
+        autotuner.save_cache_hook = MagicMock()
+        launcher = MagicMock()
+        launcher.config = triton_config({"x": 16}, 64)
+        launcher.config.found_by_combo_autotune = True
+        launcher.cache_hash = "test_hash"
+
+        autotuner.coordesc_tuner.autotune = MagicMock(return_value=launcher.config)
+
+        with patch.object(autotuner, "_ensure_kernel_loaded"):
+            autotuner._coordinate_descent_tuning(
+                launcher, *self._make_kernel_inputs()
+            )
+
+        self.assertTrue(launcher.config.found_by_coordesc)
+        self.assertTrue(launcher.config.found_by_combo_autotune)
+        autotuner.save_cache_hook.assert_called_once()
+        self.assertTrue(
+            autotuner.save_cache_hook.call_args.kwargs["found_by_combo_autotune"]
+        )
+
+    def test_combo_seed_applies_warp_stage_only_seed(self):
+        from torch.utils._ordered_set import OrderedSet
+
+        autotuner = self._make_autotuner([])
+        current_launcher = MagicMock()
+        current_launcher.config = triton.Config(
+            {"XBLOCK_0": 16}, num_warps=4, num_stages=1
+        )
+        seed_config = triton.Config({"XBLOCK": 16}, num_warps=8, num_stages=1)
+        future = MagicMock()
+        future.result.return_value = seed_config
+        autotuner.combo_standalone_autotune_seed_future = [future]
+
+        candidate_launchers = []
+
+        def precompile_config(cfg):
+            launcher = MagicMock()
+            launcher.config = cfg
+            compile_result = MagicMock()
+            compile_result.make_launcher.return_value = launcher
+            candidate_launchers.append(launcher)
+            return compile_result
+
+        with (
+            patch.object(autotuner, "_ensure_kernel_loaded"),
+            patch.object(
+                autotuner, "_precompile_config", side_effect=precompile_config
+            ) as mock_precompile,
+            patch.object(autotuner, "bench", side_effect=[2.0, 1.0]),
+        ):
+            result = autotuner._apply_combo_standalone_autotune_seed(
+                current_launcher,
+                OrderedSet(["XBLOCK_0"]),
+                [{"member_indices": [0], "skip_rblock": False}],
+                *self._make_kernel_inputs(),
+            )
+
+        self.assertEqual(mock_precompile.call_count, 2)
+        self.assertEqual(
+            [c.args[0].num_warps for c in mock_precompile.call_args_list],
+            [4, 8],
+        )
+        self.assertIs(result, candidate_launchers[1])
+
     def test_hooks_fire_in_registration_order(self):
         sentinel = object()
         seen = []
@@ -830,6 +978,32 @@ class TestRecheckAutotuneCache(TestCase):
         self.assertFalse(autotuner.compile_results[0].config.found_by_coordesc)
 
     @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_recheck_propagates_found_by_combo_autotune(self):
+        """
+        When the cached best config was already tuned from standalone
+        subkernel seeds, the marker must survive static autotuner reload.
+        """
+        cfg = triton_config({"x": 16}, 64)
+        cfg.found_by_combo_autotune = False
+        compile_result = self._make_compile_result(cfg)
+
+        autotuner = self._make_autotuner_with_results([cfg], [compile_result])
+
+        cached_cfg = triton_config({"x": 16}, 64)
+        cached_cfg.found_by_combo_autotune = True
+
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.check_autotune_cache",
+            return_value=([cached_cfg], None, {"autotune_cache_state": "hit"}),
+        ):
+            autotuner.recheck_autotune_cache(reload_kernel_from_src=MagicMock())
+
+        self.assertEqual(len(autotuner.compile_results), 1)
+        self.assertTrue(
+            autotuner.compile_results[0].config.found_by_combo_autotune
+        )
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
     def test_recheck_no_cache_hit_leaves_results_unchanged(self):
         """
         When there's no autotune cache hit, compile_results should not change.
@@ -1117,6 +1291,36 @@ class TestDynamicScaleRblockCacheInteraction(TestCase):
 
         self.assertIsNotNone(result)
         self.assertIs(result, cfg_b)
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_load_cached_autotuning_restores_combo_autotune_marker(self):
+        """
+        A combo-autotuned cache hit must not run combo seed tuning again.
+        """
+        from torch._inductor.runtime.autotune_cache import _load_cached_autotuning
+        from torch._inductor.runtime.triton_heuristics import hash_configs
+
+        cfg = triton_config({"x": 8}, 4, num_stages=1)
+        original_configs = [cfg]
+        configs_hash = hash_configs(original_configs)
+
+        best_config_data = {
+            **cfg.kwargs,
+            "num_warps": cfg.num_warps,
+            "num_stages": cfg.num_stages,
+            "configs_hash": configs_hash,
+            "found_by_combo_autotune": True,
+        }
+
+        result = _load_cached_autotuning(
+            best_config_data,
+            configs_hash,
+            original_configs,
+            {"combo_tuning_groups": [{"member_indices": [0], "skip_rblock": False}]},
+        )
+
+        self.assertIs(result, cfg)
+        self.assertTrue(result.found_by_combo_autotune)
 
     @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
     def test_load_cached_autotuning_rejects_hash_mismatch(self):
