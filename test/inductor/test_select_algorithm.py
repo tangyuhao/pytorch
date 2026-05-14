@@ -889,6 +889,28 @@ class TestDtypeViewAutotuning(TestCase):
         self.assertEqual(captured_results["example_shape"], (m, k))
 
 
+class TestGetInputsStorageSizeCheck(TestCase):
+    @requires_gpu()
+    @inductor_config.patch(max_autotune=True, inplace_padding=True)
+    def test_get_inputs_storage_check_uses_elements_not_bytes(self):
+        """
+        Regression test: get_inputs compared storage size in bytes against
+        needed size in elements, causing torch.as_strided to fail for
+        multi-byte dtypes (e.g. bfloat16) when inplace_padding produces
+        non-contiguous strides that require more storage than the base tensor.
+        """
+
+        @torch.compile
+        def foo(input, weight, bias):
+            return F.relu(F.linear(input, weight, bias))
+
+        foo(
+            torch.randn(64, 32, device=GPU_TYPE, dtype=torch.bfloat16),
+            torch.randn(16, 32, device=GPU_TYPE, dtype=torch.bfloat16),
+            torch.randn(1, 16, device=GPU_TYPE, dtype=torch.bfloat16),
+        )
+
+
 class TestTemplateRender(TestCase):
     @requires_gpu()
     @requires_triton()
