@@ -500,6 +500,19 @@ class VariableTracker(metaclass=VariableTrackerMeta):
         # Sourceless: no real object to hash — fake id.
         return id(self), True
 
+    def get_python_hash(self) -> int:
+        """Return the Python hash of this variable's value.
+
+        Subclasses with known constant values (ConstantVariable,
+        LazyConstantVariable, StringFormatVariable) override this for
+        efficiency.  The default delegates to hash_impl via the current tx.
+        """
+        from ..symbolic_convert import InstructionTranslator
+
+        tx = InstructionTranslator.current_tx()
+        h, _ = self.hash_impl(tx)
+        return h
+
     def try_peek_constant(self) -> tuple[bool, bool, Any]:
         """Try to peek at the constant value without triggering realization.
 
