@@ -56,7 +56,7 @@ from .base import (
     VariableTracker,
 )
 from .constant import ConstantVariable
-from .hashable import HashableTracker, is_hashable
+from .hashable import HashableTracker, is_hashable, raise_unhashable
 from .sets import SetVariable
 
 
@@ -132,6 +132,21 @@ class ConstDictVariable(VariableTracker):
         )
         self.original_items = items.copy()
         self.user_cls = user_cls
+
+    def is_python_constant(self) -> bool:
+        # Avoid realizing lazy entries when checking for constant-ness.
+        for key_tracker, value in self.items.items():
+            if (
+                isinstance(key_tracker.vt, variables.LazyVariableTracker)
+                and not key_tracker.vt.is_realized()
+            ):
+                return False
+            if (
+                isinstance(value, variables.LazyVariableTracker)
+                and not value.is_realized()
+            ):
+                return False
+        return super().is_python_constant()
 
     def _get_dict_cls_from_user_cls(self, user_cls: type) -> type:
         accepted_dict_types = (dict, collections.OrderedDict, collections.defaultdict)
@@ -566,7 +581,17 @@ class ConstDictVariable(VariableTracker):
                 items=self.items.copy(), mutation_type=ValueMutationNew(), source=None
             )
         elif name == "__setitem__" and self.is_mutable():
-            self.install_dict_keys_match_guard()
+            arg_hashable = args and is_hashable(args[0])
+            if not arg_hashable:
+                raise_unhashable(args[0], tx)
+
+            # For constant keys, no guard is needed - __setitem__ works the same
+            # whether the key exists or not. This avoids unnecessary recompilation
+            # when unused keys change.
+            # For non-constant keys, we need to guard all keys since the key itself
+            # could change behavior.
+            if not args[0].is_python_constant():
+                self.install_dict_keys_match_guard()
             if kwargs or len(args) != 2:
                 raise_args_mismatch(
                     tx,
