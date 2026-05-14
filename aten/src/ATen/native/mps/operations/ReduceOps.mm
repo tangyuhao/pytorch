@@ -56,7 +56,6 @@ enum MPSReductionType {
   AMIN,
   PROD,
   MEAN,
-  TRACE,
 };
 
 static void set_apparent_shapes(NSMutableArray<NSNumber*>*& apparent_out_shape,
@@ -248,12 +247,6 @@ static void reduction_out_mps(const Tensor& input_t,
         castOutputTensor = [mpsGraph reductionMaximumPropagateNaNWithTensor:castInputTensor axes:wrappedAxes name:nil];
       } else if (reduction_type == MPSReductionType::AMIN) {
         castOutputTensor = [mpsGraph reductionMinimumPropagateNaNWithTensor:castInputTensor axes:wrappedAxes name:nil];
-      } else if (reduction_type == MPSReductionType::TRACE) {
-        MPSGraphTensor* bandPartWithTensor = [mpsGraph bandPartWithTensor:castInputTensor
-                                                                 numLower:0
-                                                                 numUpper:0
-                                                                     name:nil];
-        castOutputTensor = [mpsGraph reductionSumWithTensor:bandPartWithTensor axes:@[ @0, @1 ] name:nil];
       }
 
       MPSGraphTensor* outputTensor = castOutputTensor;
@@ -1103,40 +1096,88 @@ static void count_nonzero_kernel_mps(TensorIterator& iter) {
   sum_nansum_kernel_mps(iter, "count_nonzero_");
 }
 
+// Value-only min/max reduction via the Metal value_reduction kernel.
+// `op_prefix` is "min_" or "max_".
+static void value_reduction_kernel_mps(
+    TensorIterator& iter, const std::string& op_prefix) {
+  const Tensor& output = iter.output(0);
+  const Tensor& input = iter.input(0);
+  if (input.numel() == 0 || output.numel() == 0) {
+    return;
+  }
+  // Metal's native simd_min/simd_max don't have signed-char or bool overloads.
+  // Promote those to short (value-preserving) and recurse; the result still
+  // fits in the original dtype so we can copy back via the iter's output.
+  auto in_dtype = input.scalar_type();
+  if (in_dtype == kChar || in_dtype == kBool) {
+    auto promoted_input = input.to(kShort);
+    auto promoted_output = at::empty(output.sizes(), output.options().dtype(kShort));
+    auto promoted_iter =
+        TensorIterator::reduce_op(promoted_output, promoted_input);
+    value_reduction_kernel_mps(promoted_iter, op_prefix);
+    output.copy_(promoted_output);
+    return;
+  }
+  TORCH_INTERNAL_ASSERT(output.dim() == input.dim());
+  uint32_t reduction_size = input.numel() / output.numel();
+
+  auto kernel_name =
+      fmt::format("{}reduction_{}", op_prefix, scalarToMetalTypeString(input));
+
+  MPSStream* stream = getCurrentMPSStream();
+
+  NormParams params;
+  params.ndim = input.dim();
+  params.p = 0;
+  params.reduction_size = reduction_size;
+  for (const auto dim_idx : c10::irange(input.dim())) {
+    params.input_sizes[dim_idx] = input.size(dim_idx);
+    params.input_strides[dim_idx] = input.stride(dim_idx);
+    params.output_sizes[dim_idx] = output.size(dim_idx);
+    params.output_strides[dim_idx] = output.stride(dim_idx);
+  }
+
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> compute_encoder = stream->commandEncoder();
+      auto ps = lib.getPipelineStateForFunc(kernel_name);
+      getMPSProfiler().beginProfileKernel(ps, op_prefix + "reduction", {input});
+      [compute_encoder setComputePipelineState:ps];
+      mtl_setArgs(compute_encoder, input, output, params);
+      // Round per-TG thread count up to a full simdgroup (32 lanes). With
+      // fewer threads, inactive lanes still participate in simd_shuffle but
+      // carry register-zero, corrupting min/max reductions whose identity
+      // is not zero. Padding threads load Op::identity() and contribute
+      // nothing to the result.
+      const auto threads_per_group = std::min(
+          MAX_THREADGROUP_SIZE, c10::metal::round_up(reduction_size, 32u));
+      uint32_t num_threads = output.numel() * threads_per_group;
+      [compute_encoder dispatchThreads:MTLSizeMake(num_threads, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
+      getMPSProfiler().endProfileKernel(ps);
+    }
+  });
+}
+
+static void min_values_kernel_mps(TensorIterator& iter) {
+  value_reduction_kernel_mps(iter, "min_");
+}
+
+static void max_values_kernel_mps(TensorIterator& iter) {
+  value_reduction_kernel_mps(iter, "max_");
+}
+
 Tensor trace_mps(const Tensor& self) {
   TORCH_CHECK(self.dim() == 2, "trace: expected a matrix, but got tensor with dim ", self.dim());
-
-  Tensor output_t =
-      at::empty({}, get_dtype_from_self(self, std::nullopt, true), std::nullopt, kMPS, std::nullopt, std::nullopt);
-
-  std::vector<int64_t> dims(self.dim());
-  std::iota(dims.begin(), dims.end(), 0);
-
-  reduction_out_mps(self,
-                    IntArrayRef(dims),
-                    false,
-                    std::nullopt,
-                    const_cast<Tensor&>(output_t),
-                    MPSReductionType::TRACE,
-                    "trace_mps");
-
-  return output_t;
+  // trace is just sum-of-diagonal; route through the Metal sum kernel via
+  // .diagonal().sum() instead of a dedicated MPSGraph reduction.
+  return self.diagonal().sum();
 }
 
 TORCH_IMPL_FUNC(prod_out_mps)
 (const Tensor& input_t, int64_t dim, bool keepdim, std::optional<ScalarType> dtype, const Tensor& output_t) {
   int64_t dims[1] = {dim};
   reduction_out_mps(input_t, IntArrayRef(dims, 1), keepdim, dtype, output_t, MPSReductionType::PROD, "prod_out_mps");
-}
-
-TORCH_IMPL_FUNC(amax_out_mps)(const Tensor& input_t, IntArrayRef dim, bool keepdim, const Tensor& output_t) {
-  TORCH_CHECK(!c10::isComplexType(input_t.scalar_type()), "amax is not defined for complex types");
-  reduction_out_mps(input_t, dim, keepdim, std::nullopt, output_t, MPSReductionType::AMAX, "amax_out_mps");
-}
-
-TORCH_IMPL_FUNC(amin_out_mps)(const Tensor& input_t, IntArrayRef dim, bool keepdim, const Tensor& output_t) {
-  TORCH_CHECK(!c10::isComplexType(input_t.scalar_type()), "amin is not defined for complex types");
-  reduction_out_mps(input_t, dim, keepdim, std::nullopt, output_t, MPSReductionType::AMIN, "amin_out_mps");
 }
 
 TORCH_IMPL_FUNC(aminmax_out_mps)
@@ -1642,5 +1683,7 @@ REGISTER_DISPATCH(norm_stub, &norm_kernel_mps)
 REGISTER_DISPATCH(sum_stub, &sum_kernel_mps)
 REGISTER_DISPATCH(nansum_stub, &nansum_kernel_mps)
 REGISTER_DISPATCH(mean_stub, &mean_kernel_mps)
+REGISTER_DISPATCH(min_values_stub, &min_values_kernel_mps)
+REGISTER_DISPATCH(max_values_stub, &max_values_kernel_mps)
 
 } // namespace at::native

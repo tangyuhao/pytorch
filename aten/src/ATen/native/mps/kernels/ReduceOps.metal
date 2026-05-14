@@ -715,3 +715,251 @@ REGISTER_COUNT_NONZERO_INNER(uchar);
 REGISTER_COUNT_NONZERO_INNER(bool);
 REGISTER_COUNT_NONZERO_INNER(float2);
 REGISTER_COUNT_NONZERO_INNER(half2);
+
+// =============================================================================
+// min/max value-only reductions (amin / amax)
+// =============================================================================
+
+// Reduction op functors. Each Op defines identity<T>(), combine(), and
+// simd_reduce(). Identity is the "neutral" element for the op (-INF for max
+// on floats, numeric_limits<T>::lowest() for integers, etc.).
+// NaN-aware combine: for floats, an incoming NaN must propagate to the
+// accumulator; for integer/bool types, NaN doesn't exist so the ternary
+// branch reduces to a straight max/min. `a != a` detects NaN without needing
+// isnan (which has overload-resolution ambiguities across namespaces).
+template <typename T>
+inline T max_combine(T a, T b) {
+  return (a != a) ? a : ((b != b) ? b : (a > b ? a : b));
+}
+template <typename T>
+inline T min_combine(T a, T b) {
+  return (a != a) ? a : ((b != b) ? b : (a < b ? a : b));
+}
+
+// Lowest/highest-representable values per integer dtype. Metal's
+// ::metal::numeric_limits isn't reliably populated for long/signed char, so
+// hardcode them. For 64-bit long we reinterpret an int2 bit pattern because
+// Metal rejects literals like 0x8000000000000000L as out-of-range for signed
+// long.
+template <typename T>
+inline T int_lowest();
+template <>
+inline long int_lowest<long>() {
+  // LONG_MIN = 0x8000000000000000; Metal rejects the 64-bit literal, so
+  // reinterpret the bit pattern (little-endian: low=0, high=0x80000000).
+  return as_type<long>(int2(0, int(0x80000000)));
+}
+template <>
+inline int int_lowest<int>() {
+  return int(0x80000000);
+}
+template <>
+inline short int_lowest<short>() {
+  return short(0x8000);
+}
+template <>
+inline char int_lowest<char>() {
+  return char(0x80);
+}
+template <>
+inline uchar int_lowest<uchar>() {
+  return uchar(0);
+}
+template <typename T>
+inline T int_highest();
+template <>
+inline long int_highest<long>() {
+  return as_type<long>(int2(-1, int(0x7FFFFFFF)));
+}
+template <>
+inline int int_highest<int>() {
+  return int(0x7FFFFFFF);
+}
+template <>
+inline short int_highest<short>() {
+  return short(0x7FFF);
+}
+template <>
+inline char int_highest<char>() {
+  return char(0x7F);
+}
+template <>
+inline uchar int_highest<uchar>() {
+  return uchar(0xFF);
+}
+
+struct MaxOp {
+  template <typename T, ::metal::enable_if_t<!is_floating_point_v<T>, bool> = true>
+  static inline T identity() {
+    return int_lowest<T>();
+  }
+  template <typename T, ::metal::enable_if_t<is_floating_point_v<T>, bool> = true>
+  static inline T identity() {
+    return T(-INFINITY);
+  }
+  template <typename T>
+  static inline T combine(T a, T b) {
+    return max_combine(a, b);
+  }
+  template <typename T>
+  static inline T simd_reduce(T val) {
+    return c10::metal::simd_max(val);
+  }
+};
+
+struct MinOp {
+  template <typename T, ::metal::enable_if_t<!is_floating_point_v<T>, bool> = true>
+  static inline T identity() {
+    return int_highest<T>();
+  }
+  template <typename T, ::metal::enable_if_t<is_floating_point_v<T>, bool> = true>
+  static inline T identity() {
+    return T(INFINITY);
+  }
+  template <typename T>
+  static inline T combine(T a, T b) {
+    return min_combine(a, b);
+  }
+  template <typename T>
+  static inline T simd_reduce(T val) {
+    return c10::metal::simd_min(val);
+  }
+};
+
+// General value reduction: same 2D-via-NormParams layout as sum_reduction,
+// parameterised on the reduction op. Input and output dtype match (min/max
+// never promote). Output stride handling mirrors sum_reduction.
+template <typename Op, typename T, uint NCHAINS = SUM_NCHAINS>
+kernel void value_reduction(
+    constant T* input [[buffer(0)]],
+    device T* output [[buffer(1)]],
+    constant NormParams<>& params [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simdgroup_size [[threads_per_simdgroup]]) {
+  uint32_t input_base = 0;
+  uint32_t reduction_stride = 1;
+  uint32_t num_reduced_dims = 0;
+  {
+    uint32_t out_idx = tgid;
+    for (int32_t dim = params.ndim - 1; dim >= 0; dim--) {
+      if (params.input_sizes[dim] != params.output_sizes[dim]) {
+        num_reduced_dims++;
+        reduction_stride = params.input_strides[dim];
+      } else {
+        auto idx = out_idx % params.output_sizes[dim];
+        out_idx /= params.output_sizes[dim];
+        input_base += idx * params.input_strides[dim];
+      }
+    }
+  }
+
+  const T identity_val = Op::template identity<T>();
+  metal::array<T, NCHAINS> acc;
+  for (uint j = 0; j < NCHAINS; j++) {
+    acc[j] = identity_val;
+  }
+
+  const uint32_t rsize = params.reduction_size;
+  const uint32_t stride = tptg * NCHAINS;
+  uint32_t base = tid * NCHAINS;
+
+  if (num_reduced_dims <= 1) {
+    for (; base + NCHAINS <= rsize; base += stride) {
+      for (uint j = 0; j < NCHAINS; j++) {
+        acc[j] = Op::combine(
+            acc[j], input[input_base + (base + j) * reduction_stride]);
+      }
+    }
+    for (uint32_t idx = base; idx < rsize; idx++) {
+      acc[idx % NCHAINS] = Op::combine(
+          acc[idx % NCHAINS], input[input_base + idx * reduction_stride]);
+    }
+  } else {
+    for (; base + NCHAINS <= rsize; base += stride) {
+      for (uint j = 0; j < NCHAINS; j++) {
+        acc[j] = Op::combine(
+            acc[j], input[get_input_offset(base + j, tgid, params)]);
+      }
+    }
+    for (uint32_t idx = base; idx < rsize; idx++) {
+      acc[idx % NCHAINS] = Op::combine(
+          acc[idx % NCHAINS], input[get_input_offset(idx, tgid, params)]);
+    }
+  }
+
+  T output_val = acc[0];
+  for (uint j = 1; j < NCHAINS; j++) {
+    output_val = Op::combine(output_val, acc[j]);
+  }
+
+  auto threads_remaining = tptg;
+  threadgroup T shared_outputs[MAX_THREADGROUP_SIZE];
+
+  while (threads_remaining > 1) {
+    output_val = Op::simd_reduce(output_val);
+    threads_remaining = ceil_div(threads_remaining, simdgroup_size);
+
+    if (threads_remaining > 1) {
+      if (simd_lane_id == 0) {
+        shared_outputs[simdgroup_id] = output_val;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Load identity (not early-return) for lanes past threads_remaining:
+      // the next iteration's simd_reduce requires all lanes in the simdgroup
+      // to hold valid values, else inactive lanes contribute register-zero
+      // and corrupt reductions whose identity != 0 (e.g. int64 max = LONG_MIN).
+      output_val =
+          (tid < threads_remaining) ? shared_outputs[tid] : identity_val;
+    }
+  }
+
+  if (tid == 0) {
+    uint32_t output_offset = 0;
+    uint32_t reduction_idx = tgid;
+    for (int32_t dim = params.ndim - 1; dim >= 0; dim--) {
+      auto output_dim_size = params.output_sizes[dim];
+      if (output_dim_size > 1) {
+        auto index_in_dim = reduction_idx % output_dim_size;
+        reduction_idx /= output_dim_size;
+        output_offset += index_in_dim * params.output_strides[dim];
+      }
+    }
+    output[output_offset] = output_val;
+  }
+}
+
+#define REGISTER_VALUE_REDUCTION_IMPL(T, PREFIX, OP)        \
+  template [[host_name(PREFIX "reduction_" #T)]]            \
+  kernel void value_reduction<OP, T, SUM_NCHAINS>(          \
+      constant T * input [[buffer(0)]],                     \
+      device T * output [[buffer(1)]],                      \
+      constant NormParams<> & params [[buffer(2)]],         \
+      uint tid [[thread_position_in_threadgroup]],          \
+      uint tptg [[threads_per_threadgroup]],                \
+      uint tgid [[threadgroup_position_in_grid]],           \
+      uint simd_lane_id [[thread_index_in_simdgroup]],      \
+      uint simdgroup_id [[simdgroup_index_in_threadgroup]], \
+      uint simdgroup_size [[threads_per_simdgroup]]);
+
+#define REGISTER_MAX(T) REGISTER_VALUE_REDUCTION_IMPL(T, "max_", MaxOp)
+#define REGISTER_MIN(T) REGISTER_VALUE_REDUCTION_IMPL(T, "min_", MinOp)
+
+REGISTER_MAX(float);
+REGISTER_MAX(half);
+REGISTER_MAX(bfloat);
+REGISTER_MAX(long);
+REGISTER_MAX(int);
+REGISTER_MAX(short);
+REGISTER_MAX(uchar);
+
+REGISTER_MIN(float);
+REGISTER_MIN(half);
+REGISTER_MIN(bfloat);
+REGISTER_MIN(long);
+REGISTER_MIN(int);
+REGISTER_MIN(short);
+REGISTER_MIN(uchar);

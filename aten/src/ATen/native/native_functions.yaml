@@ -3978,8 +3978,7 @@
 - func: amax.out(Tensor self, int[1] dim=[], bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
   structured: True
   dispatch:
-    CPU, CUDA: amax_out
-    MPS: amax_out_mps
+    CPU, CUDA, MPS: amax_out
   tags: reduction
 
 # Return: (Tensor output, Tensor indices)
@@ -4166,8 +4165,7 @@
 - func: amin.out(Tensor self, int[1] dim=[], bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)
   structured: True
   dispatch:
-    CPU, CUDA: amin_out
-    MPS: amin_out_mps
+    CPU, CUDA, MPS: amin_out
   tags: reduction
 
 # TODO: Add this function to MPS dispatch key so that we avoid declaring it in
