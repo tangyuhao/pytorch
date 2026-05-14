@@ -74,6 +74,7 @@ from ..source import (
     SyntheticLocalSource,
 )
 from ..utils import (
+    check_args_peekable_as_constant,
     check_unspec_or_constant_args,
     guard_if_dyn,
     has_torch_function,
@@ -505,7 +506,25 @@ class BaseTorchVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
-        dunder = "__ror__" if reverse else "__or__"
+        return self._nb_binop_impl(tx, other, "__or__", "__ror__", reverse)
+
+    def nb_subtract_impl(
+        self,
+        tx: "InstructionTranslator",
+        other: VariableTracker,
+        reverse: bool = False,
+    ) -> VariableTracker:
+        return self._nb_binop_impl(tx, other, "__sub__", "__rsub__", reverse)
+
+    def _nb_binop_impl(
+        self,
+        tx: "InstructionTranslator",
+        other: VariableTracker,
+        forward: str,
+        reverse_dunder: str,
+        reverse: bool,
+    ) -> VariableTracker:
+        dunder = reverse_dunder if reverse else forward
         method = getattr(type(self.value), dunder, None)
         if method is None:
             return VariableTracker.build(tx, NotImplemented)
@@ -2900,6 +2919,9 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
     ) -> "VariableTracker":
         from . import SymNodeVariable
         from .builder import wrap_fx_proxy
+        from .lazy import LazyVariableTracker
+
+        args = [a.realize() if isinstance(a, LazyVariableTracker) else a for a in args]
 
         if self.kind == AllowInGraphKind.NONSTRICT_TRACE:
             return self._call_nonstrict_traceable_function(tx, args, kwargs)
@@ -2910,8 +2932,9 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
         if self.torch_function_override_enabled(tx, args, kwargs):
             return dispatch_torch_function(tx, self, args, kwargs)
 
-        if self.can_constant_fold_through() and check_unspec_or_constant_args(
-            args, kwargs
+        if self.can_constant_fold_through() and (
+            check_unspec_or_constant_args(args, kwargs)
+            or check_args_peekable_as_constant(args, kwargs)
         ):
             # constant fold functions need to be guarded.
             if self.value in constant_fold_functions_need_guards:
@@ -2922,6 +2945,8 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                 source = CallFunctionNoArgsSource(self.source)
                 install_guard(source.make_guard(GuardBuilder.EQUALS_MATCH))
             # constant fold
+            from .base import AsPythonConstantNotImplementedError
+
             try:
                 return VariableTracker.build(
                     tx,
@@ -2930,6 +2955,8 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                         **{k: v.as_python_constant() for k, v in kwargs.items()},
                     ),
                 )
+            except AsPythonConstantNotImplementedError:
+                pass
             except (OverflowError, TypeError, ValueError) as exc:
                 raise_observed_exception(
                     type(exc),
