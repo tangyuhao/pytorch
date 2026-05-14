@@ -15902,9 +15902,6 @@ op_db: list[OpInfo] = [
             DecorateInfo(unittest.expectedFailure, "TestExpandedWeightFunctional", "test_expanded_weight_per_sample_grad_sum"),
             DecorateInfo(unittest.expectedFailure, "TestExpandedWeightFunctional", "test_expanded_weights_per_sample_grad_input_no_grad"),
             DecorateInfo(unittest.expectedFailure, "TestJit", "test_variant_consistency_jit"),
-            # fails in TorchScript interpreter with failures associated with batch_norm
-            DecorateInfo(unittest.expectedFailure, "TestLazyOpInfo", "test_correctness"),
-            DecorateInfo(unittest.expectedFailure, "TestLazyOpInfo", "test_correctness_with_reusing_ir"),
             # lazy dispatch failure
             DecorateInfo(unittest.expectedFailure, "TestLazyOpInfo", "test_dispatched_to_lazy"),
         ),
