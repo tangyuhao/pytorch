@@ -26366,11 +26366,8 @@ python_ref_db = [
     PythonRefInfo(
         "_refs.native_group_norm",
         skips=(
-            # The torch implementation does not return a view, while the reference does
-            DecorateInfo(unittest.expectedFailure, "TestCommon", "test_python_ref"),
-            DecorateInfo(unittest.expectedFailure, "TestCommon", "test_python_ref_executor"),
-            DecorateInfo(unittest.expectedFailure, "TestCommon", "test_python_ref_torch_fallback"),
             # RuntimeError: mean(): could not infer output dtype. Input dtype must be either a floating point or complex dtype
+            DecorateInfo(unittest.expectedFailure, "TestCommon", "test_python_ref", device_type="mps", dtypes=(torch.int32, torch.int16, torch.int8, torch.uint8)),
             DecorateInfo(unittest.expectedFailure, "TestCommon", "test_python_ref_meta", device_type="mps", dtypes=(torch.int32, torch.int16, torch.int8, torch.uint8)),
         ),
         torch_opinfo_name="native_group_norm",
